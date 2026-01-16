@@ -8,23 +8,24 @@ from openai import OpenAI
 import edge_tts
 
 # ================= 配置区 =================
-# 自动读取环境变量，如果没设置默认为空字符串
 API_KEY = os.getenv("API_KEY", "").strip()
 BASE_URL = "https://api.siliconflow.cn/v1"
-MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct" # 推荐使用 Instruct 版本
+MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct" 
 
-# 延迟初始化客户端（防止构建时因缺 Key 报错）
+# 延迟初始化客户端
 client = None
 
 def get_client():
     global client
     if client is None:
         if not API_KEY:
-            # 尝试再次读取（应对某些云平台的延迟注入）
+            # 再次尝试读取
             key = os.getenv("API_KEY", "").strip()
             if not key:
-                raise ValueError("❌ 错误: API_KEY 未设置！请在云平台环境变量中配置。")
-            client = OpenAI(api_key=key, base_url=BASE_URL)
+                # 本地测试如果没有 key，不会报错，只会连不上
+                print("⚠️ 警告: 环境变量 API_KEY 未设置")
+            else:
+                client = OpenAI(api_key=key, base_url=BASE_URL)
         else:
             client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
     return client
@@ -33,22 +34,42 @@ app = FastAPI()
 
 @app.get("/")
 def read_root():
-    """通用健康检查接口"""
-    return {
-        "status": "Running", 
-        "platform": "Universal (HF/Zeabur)",
-        "api_key_set": bool(API_KEY)
-    }
+    return {"status": "Universal App Running", "version": "Clean-Fix-v2"}
 
-# 辅助：情感 TTS 生成 (带强制清洗)
+# 🔥🔥🔥 暴力清洗函数 🔥🔥🔥
+def aggressive_clean(text):
+    if not text: return ""
+    
+    # 1. 先做标准正则清洗 (删掉 <happy>, <sad> 等标准格式)
+    text = re.sub(r'<.*?>', '', text)
+    text = re.sub(r'\[.*?\]', '', text) # 防止出现 [happy]
+    text = re.sub(r'\(.*?\)', '', text) # 防止出现 (happy)
+
+    # 2. 针对您遇到的 "neutral>" 做定点爆破
+    # 只要看到这些词的残留，统统删掉
+    dirty_words = [
+        "neutral>", "<neutral", "neutral", 
+        "happy>", "<happy", 
+        "angry>", "<angry",
+        "sad>", "<sad"
+    ]
+    for word in dirty_words:
+        text = text.replace(word, "")
+        
+    # 3. 再次去头去尾的空格
+    return text.strip()
+
+# 辅助：情感 TTS 生成
 async def generate_emotional_audio(text, emotion_tag):
-    # 1. 第一道防线：强制清洗标签
-    clean_text = re.sub(r'<.*?>', '', text).strip()
+    # 🌟 调用暴力清洗
+    clean_text = aggressive_clean(text)
+    
     if not clean_text: return None
     
     rate = "+25%"
     pitch = "+0Hz"
     
+    # 简单的关键词匹配，即使标签乱了也能大概率猜对
     if "angry" in emotion_tag:
         rate = "+40%"; pitch = "+5Hz"
     elif "sad" in emotion_tag:
@@ -57,7 +78,7 @@ async def generate_emotional_audio(text, emotion_tag):
         rate = "+30%"; pitch = "+2Hz"
     
     try:
-        # 补句号防止吞音
+        # 补句号
         communicate = edge_tts.Communicate(text=clean_text + "。", voice="zh-CN-XiaoxiaoNeural", rate=rate, pitch=pitch)
         audio_data = b""
         async for chunk in communicate.stream():
@@ -74,10 +95,8 @@ async def websocket_endpoint(websocket: WebSocket):
     print("📱 前端已连接")
     
     try:
-        # 连接建立时检查客户端
         client_instance = get_client()
-    except Exception as e:
-        await websocket.send_json({"type": "error", "content": str(e)})
+    except:
         await websocket.close()
         return
 
@@ -87,8 +106,16 @@ async def websocket_endpoint(websocket: WebSocket):
             print(f"👂 收到: {user_text}")
             
             try:
-                # 提示词：要求短回复 + 情感标签
-                system_prompt = "你是一个高情商助手。回复简短(40字内)。开头用 <happy>/<angry> 标记情绪。"
+                # 🔥🔥🔥 Prompt 核心修改 🔥🔥🔥
+                # 明确指示：如果是 neutral，就不要输出标签！这样从源头解决问题。
+                system_prompt = """
+                你是一个高情商助手。回复简短(40字内)。
+                情感标记规则：
+                1. 只有在【非常开心】时才用 <happy>。
+                2. 只有在【生气】时才用 <angry>。
+                3. 平淡或正常语气【不要】使用任何标签，也不要输出 <neutral>。
+                """
+                
                 response = client_instance.chat.completions.create(
                     model=MODEL_NAME,
                     messages=[
@@ -108,45 +135,38 @@ async def websocket_endpoint(websocket: WebSocket):
                         char = chunk.choices[0].delta.content
                         buffer += char
                         
-                        # 情感提取 (只在开头)
+                        # 尝试提取情绪 (保留逻辑以防万一 AI 还是输出了)
                         if is_first and "<" in buffer and ">" in buffer:
                             match = re.search(r'<(.*?)>', buffer)
                             if match: current_emotion = match.group(1)
-                            buffer = re.sub(r'<.*?>', '', buffer) # 删掉标签
+                            # 只要检测到尖括号，就视为标签清除掉
+                            buffer = re.sub(r'<.*?>', '', buffer)
 
-                        # 断句发送逻辑
+                        # 断句
                         if re.search(r'[，。！？、；\n]', char) or (is_first and len(buffer) > 5):
-                            # 第二道防线：再次清洗
-                            text_segment = re.sub(r'<.*?>', '', buffer).strip()
+                            # 发送前调用暴力清洗
+                            text_segment = aggressive_clean(buffer)
                             
                             if text_segment:
-                                # 发文字
                                 await websocket.send_json({"type": "text", "content": text_segment})
-                                # 发音频
                                 audio = await generate_emotional_audio(text_segment, current_emotion)
-                                if audio:
-                                    await websocket.send_json({"type": "audio_base64", "data": audio})
+                                if audio: await websocket.send_json({"type": "audio_base64", "data": audio})
                             
                             buffer = ""; is_first = False
 
                 # 尾巴处理
-                text_segment = re.sub(r'<.*?>', '', buffer).strip()
+                text_segment = aggressive_clean(buffer)
                 if text_segment:
                     await websocket.send_json({"type": "text", "content": text_segment})
                     audio = await generate_emotional_audio(text_segment, current_emotion)
                     if audio: await websocket.send_json({"type": "audio_base64", "data": audio})
 
             except Exception as e:
-                print(f"处理错误: {e}")
-                await websocket.send_json({"type": "error", "content": "AI 思考超时"})
+                print(f"AI Error: {e}")
 
     except WebSocketDisconnect:
         print("🔌 断开连接")
 
-# 🔥🔥🔥 核心：通用启动逻辑 🔥🔥🔥
 if __name__ == "__main__":
-    # 1. 尝试读取环境变量 PORT (Zeabur/Render 会自动注入这个变量)
-    # 2. 如果没读到，默认使用 7860 (Hugging Face 的强制端口)
     port = int(os.environ.get("PORT", 7860))
-    print(f"🚀 Server starting on port: {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
