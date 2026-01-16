@@ -8,108 +8,86 @@ from openai import OpenAI
 import edge_tts
 
 # ================= 配置区 =================
-# 建议检查 Zeabur 环境变量设置
+# 自动读取环境变量，如果没设置默认为空字符串
 API_KEY = os.getenv("API_KEY", "").strip()
 BASE_URL = "https://api.siliconflow.cn/v1"
-MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct" # 如果发现回答不听指令，建议改回 "Qwen/Qwen2.5-7B-Instruct"
+MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct" # 推荐使用 Instruct 版本
 
-# 延迟初始化客户端
+# 延迟初始化客户端（防止构建时因缺 Key 报错）
 client = None
 
 def get_client():
-    """延迟初始化 OpenAI 客户端，避免启动时错误"""
     global client
     if client is None:
         if not API_KEY:
-            raise ValueError("API_KEY 环境变量未设置或为空")
-        try:
+            # 尝试再次读取（应对某些云平台的延迟注入）
+            key = os.getenv("API_KEY", "").strip()
+            if not key:
+                raise ValueError("❌ 错误: API_KEY 未设置！请在云平台环境变量中配置。")
+            client = OpenAI(api_key=key, base_url=BASE_URL)
+        else:
             client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
-        except Exception as e:
-            raise RuntimeError(f"初始化 OpenAI 客户端失败: {str(e)}")
     return client
 
 app = FastAPI()
 
 @app.get("/")
 def read_root():
-    """健康检查端点"""
+    """通用健康检查接口"""
     return {
-        "status": "Zeabur WSS Running",
-        "api_configured": bool(API_KEY),
-        "message": "WebSocket endpoint: /ws"
+        "status": "Running", 
+        "platform": "Universal (HF/Zeabur)",
+        "api_key_set": bool(API_KEY)
     }
 
-@app.get("/health")
-def health_check():
-    """健康检查"""
-    return {"status": "ok"}
-
-# 辅助：情感 TTS 生成
+# 辅助：情感 TTS 生成 (带强制清洗)
 async def generate_emotional_audio(text, emotion_tag):
-    """生成情感语音"""
-    
-    # 🔥🔥🔥 核心修复点在这里 🔥🔥🔥
-    # 无论传入什么文本，先强制把所有的 <xxx> 标签删干净
-    # 这样 Edge-TTS 绝对不可能读出标签
+    # 1. 第一道防线：强制清洗标签
     clean_text = re.sub(r'<.*?>', '', text).strip()
-    
-    # 如果洗完之后没字了，直接返回
-    if not clean_text:
-        return None
+    if not clean_text: return None
     
     rate = "+25%"
     pitch = "+0Hz"
     
     if "angry" in emotion_tag:
-        rate = "+40%"
-        pitch = "+5Hz"
+        rate = "+40%"; pitch = "+5Hz"
     elif "sad" in emotion_tag:
-        rate = "+0%"
-        pitch = "-5Hz"
+        rate = "+0%"; pitch = "-5Hz"
     elif "happy" in emotion_tag:
-        rate = "+30%"
-        pitch = "+2Hz"
+        rate = "+30%"; pitch = "+2Hz"
     
     try:
-        communicate = edge_tts.Communicate(
-            text=clean_text + "。", # 这里使用清洗后的 clean_text
-            voice="zh-CN-XiaoxiaoNeural",
-            rate=rate,
-            pitch=pitch
-        )
+        # 补句号防止吞音
+        communicate = edge_tts.Communicate(text=clean_text + "。", voice="zh-CN-XiaoxiaoNeural", rate=rate, pitch=pitch)
         audio_data = b""
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 audio_data += chunk["data"]
         return base64.b64encode(audio_data).decode('utf-8')
     except Exception as e:
-        print(f"⚠️ TTS 生成失败: {str(e)}")
+        print(f"TTS Error: {e}")
         return None
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket 端点"""
     await websocket.accept()
-    print("📱 前端 WSS 已连接")
+    print("📱 前端已连接")
     
     try:
-        # 检查 API_KEY
-        if not API_KEY:
-            await websocket.send_json({
-                "type": "error",
-                "content": "API_KEY 未配置，请在环境变量中设置"
-            })
-            await websocket.close()
-            return
-        
+        # 连接建立时检查客户端
         client_instance = get_client()
-        
+    except Exception as e:
+        await websocket.send_json({"type": "error", "content": str(e)})
+        await websocket.close()
+        return
+
+    try:
         while True:
             user_text = await websocket.receive_text()
             print(f"👂 收到: {user_text}")
             
             try:
-                # 1. 思考 (流式)
+                # 提示词：要求短回复 + 情感标签
                 system_prompt = "你是一个高情商助手。回复简短(40字内)。开头用 <happy>/<angry> 标记情绪。"
                 response = client_instance.chat.completions.create(
                     model=MODEL_NAME,
@@ -130,63 +108,45 @@ async def websocket_endpoint(websocket: WebSocket):
                         char = chunk.choices[0].delta.content
                         buffer += char
                         
-                        # 提取情绪 (保留这部分逻辑用于提取，但不依赖它清洗)
+                        # 情感提取 (只在开头)
                         if is_first and "<" in buffer and ">" in buffer:
                             match = re.search(r'<(.*?)>', buffer)
-                            if match:
-                                current_emotion = match.group(1)
-                            buffer = re.sub(r'<.*?>', '', buffer)
+                            if match: current_emotion = match.group(1)
+                            buffer = re.sub(r'<.*?>', '', buffer) # 删掉标签
 
-                        # 断句逻辑
+                        # 断句发送逻辑
                         if re.search(r'[，。！？、；\n]', char) or (is_first and len(buffer) > 5):
-                            # 这里做一次初步清洗
+                            # 第二道防线：再次清洗
                             text_segment = re.sub(r'<.*?>', '', buffer).strip()
                             
                             if text_segment:
-                                # 1. 发文字 (给前端展示用)
-                                await websocket.send_json({
-                                    "type": "text",
-                                    "content": text_segment
-                                })
-                                # 2. 发音频 (传入原始片段，反正 generate_emotional_audio 里面会再洗一次)
+                                # 发文字
+                                await websocket.send_json({"type": "text", "content": text_segment})
+                                # 发音频
                                 audio = await generate_emotional_audio(text_segment, current_emotion)
                                 if audio:
-                                    await websocket.send_json({
-                                        "type": "audio_base64",
-                                        "data": audio
-                                    })
+                                    await websocket.send_json({"type": "audio_base64", "data": audio})
                             
-                            buffer = ""
-                            is_first = False
+                            buffer = ""; is_first = False
 
-                # 处理尾巴
+                # 尾巴处理
                 text_segment = re.sub(r'<.*?>', '', buffer).strip()
                 if text_segment:
-                    await websocket.send_json({
-                        "type": "text",
-                        "content": text_segment
-                    })
+                    await websocket.send_json({"type": "text", "content": text_segment})
                     audio = await generate_emotional_audio(text_segment, current_emotion)
-                    if audio:
-                        await websocket.send_json({
-                            "type": "audio_base64",
-                            "data": audio
-                        })
-                        
+                    if audio: await websocket.send_json({"type": "audio_base64", "data": audio})
+
             except Exception as e:
-                print(f"❌ 处理请求失败: {str(e)}")
-                await websocket.send_json({
-                    "type": "error",
-                    "content": f"处理失败: {str(e)}"
-                })
-                
+                print(f"处理错误: {e}")
+                await websocket.send_json({"type": "error", "content": "AI 思考超时"})
+
     except WebSocketDisconnect:
         print("🔌 断开连接")
-    except Exception as e:
-        print(f"❌ WebSocket 错误: {str(e)}")
 
+# 🔥🔥🔥 核心：通用启动逻辑 🔥🔥🔥
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    print(f"🚀 启动服务器，监听端口 {port}")
-    print(f"📝 API_KEY 配置: {'✅ 已配置' if API_KEY else '❌ 未配置'}")
+    # 1. 尝试读取环境变量 PORT (Zeabur/Render 会自动注入这个变量)
+    # 2. 如果没读到，默认使用 7860 (Hugging Face 的强制端口)
+    port = int(os.environ.get("PORT", 7860))
+    print(f"🚀 Server starting on port: {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
